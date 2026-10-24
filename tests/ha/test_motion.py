@@ -47,6 +47,7 @@ async def test_http_reports_follow_common_event_paths_and_clear_without_replay(
     await hass.async_block_till_done()
     assert emit.call_args.args[0] == "motion_cleared"
     assert device.key not in coordinator.motion_active
+    assert coordinator._clip_poll_cancel is None
     emit.reset_mock()
     coordinator.motion_ready = False
     coordinator.async_report_motion(device.key, source="recording", event_id="baseline")
@@ -344,6 +345,107 @@ async def test_backend_can_be_replaced_without_changing_entities(hass, motion_se
         coordinator.async_report_motion("missing", source="blink_push", event_id="2")
     with pytest.raises(HomeAssistantError):
         coordinator.async_report_motion(device.key, source="unknown", event_id="2")
+
+
+async def advance_motion_clock(hass, freezer, seconds):
+    freezer.tick(timedelta(seconds=seconds))
+    async_fire_time_changed(hass, dt_util.utcnow())
+    await hass.async_block_till_done()
+
+
+@pytest.mark.parametrize("motion_setup", ["usb", "cloud", "all"], indirect=True)
+async def test_live_motion_fast_poll_downloads_and_stops(
+    hass, freezer, motion_setup, device, tmp_path
+):
+    entry, data, _, _, _ = motion_setup
+    coordinator = entry.runtime_data
+    coordinator.options.update(live_events=True, live_motion_timeout=1)
+    coordinator.motion_backend = "blink_push"
+    coordinator.recordings.automatic = True
+    coordinator.recordings.directory = tmp_path
+    attempts = 0
+
+    async def chunks(clip):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise BlinkError("Video not ready")
+        yield b"\x00\x00\x00\x18ftypmp42video"
+
+    coordinator.client.clip_chunks = chunks
+    refresh = AsyncMock(wraps=coordinator.recordings.refresh)
+    coordinator.recordings.refresh = refresh
+    coordinator.async_report_motion(device.key, source="blink_push", event_id="motion")
+    await advance_motion_clock(hass, freezer, 1)
+    assert device.key in coordinator._clip_windows
+    await advance_motion_clock(hass, freezer, 3)
+    refresh.assert_not_awaited()
+    source = "cloud" if coordinator.options["recording_source"] == "cloud" else "usb"
+    new = replace(data[source][0], id="new")
+    data[source].append(new)
+    coordinator.client.discover.reset_mock()
+    await advance_motion_clock(hass, freezer, 2)
+    refresh.assert_awaited_once()
+    coordinator.client.discover.assert_not_awaited()
+    assert device.key in coordinator._clip_windows  # Discovery alone cannot finish a download.
+    assert new.key not in coordinator.recordings.state["archive"]
+    await advance_motion_clock(hass, freezer, 5)
+    assert new.key in coordinator.recordings.state["archive"]
+    assert not coordinator._clip_windows
+    assert coordinator._clip_poll_cancel is None
+    assert coordinator.update_interval == timedelta(seconds=60)
+    await advance_motion_clock(hass, freezer, 5)
+    assert refresh.await_count == 2
+
+
+async def test_live_motion_fast_poll_expires_and_unload_cancels(
+    hass, freezer, motion_setup, device
+):
+    entry, _, _, other, _ = motion_setup
+    coordinator = entry.runtime_data
+    coordinator.options.update(live_events=True, live_motion_timeout=1)
+    coordinator.motion_backend = "blink_push"
+    refresh = coordinator.recordings.refresh = AsyncMock(side_effect=BlinkError("Not ready"))
+    coordinator.async_report_motion(device.key, source="blink_push", event_id="first")
+    await advance_motion_clock(hass, freezer, 1)
+    for _ in range(12):
+        await advance_motion_clock(hass, freezer, 5)
+    # Twelve fast checks, plus the independent normal poll at 60 seconds.
+    assert refresh.await_count == 13
+    assert not coordinator._clip_windows
+    assert coordinator._clip_poll_cancel is None
+    count = refresh.await_count
+    await advance_motion_clock(hass, freezer, 5)
+    assert refresh.await_count == count
+    coordinator.async_report_motion(other.key, source="blink_push", event_id="other")
+    await advance_motion_clock(hass, freezer, 1)
+    assert coordinator._clip_poll_cancel is not None
+    await coordinator.close()
+    await advance_motion_clock(hass, freezer, 5)
+    assert refresh.await_count == count
+
+
+async def test_fast_poll_waits_for_each_camera_and_ignores_old_downloads(
+    hass, freezer, motion_setup, device
+):
+    entry, data, _, other, _ = motion_setup
+    coordinator = entry.runtime_data
+    coordinator.options.update(live_events=True, live_motion_timeout=1)
+    coordinator.motion_backend = "blink_push"
+    for camera in (device, other):
+        coordinator.async_report_motion(camera.key, source="blink_push", event_id=camera.key)
+    await advance_motion_clock(hass, freezer, 1)
+    coordinator.recordings.automatic = True
+    await coordinator._notify("clip_saved", data["usb"][0].event_data())
+    assert len(coordinator._clip_windows) == 2
+    coordinator.recordings.automatic = False
+    data["usb"].append(replace(data["usb"][0], id="new"))
+    await advance_motion_clock(hass, freezer, 5)
+    assert device.key not in coordinator._clip_windows
+    assert other.key in coordinator._clip_windows
+    data["usb"].append(replace(data["usb"][0], id="other", camera_key=other.key))
+    await advance_motion_clock(hass, freezer, 5)
+    assert not coordinator._clip_windows
 
 
 async def test_opt_in_push_routing_status_and_reload(hass, motion_setup, device, freezer):
@@ -742,6 +844,73 @@ async def test_cancelled_snapshot_preserves_cache_and_releases_lock(hass, motion
     coordinator.client.capture_snapshot = AsyncMock(return_value=b"\xff\xd8new")
     await coordinator.async_take_snapshot(device.key)
     assert coordinator.snapshots[device.key] == b"\xff\xd8new"
+
+
+async def test_archived_snapshot_is_shared_by_camera_and_http(
+    hass, motion_setup, device, tmp_path, hass_client_no_auth
+):
+    from urllib.parse import urlsplit
+
+    from homeassistant.components.camera import get_camera_from_entity_id
+
+    from custom_components.blink_live.blink_live_client.recordings import fingerprint
+    from custom_components.blink_live.snapshot import snapshot_url
+
+    entry, data, entity, _, _ = motion_setup
+    coordinator = entry.runtime_data
+    coordinator.options["automatic_downloads"] = True
+    coordinator.snapshot_cache.derived_enabled = True
+    now = dt_util.utcnow()
+    await coordinator.snapshot_cache.update(
+        device.key, "blink", b"\xff\xd8blink", now - timedelta(minutes=1)
+    )
+    clip = replace(data["usb"][0], created_at=now.isoformat())
+    path = tmp_path / "clip.mp4"
+    path.write_bytes(b"archived video")
+    coordinator.recordings.state["archive"][clip.key] = {
+        "clip": clip.to_dict(), "path": str(path), "fingerprint": fingerprint(path)
+    }
+    camera = get_camera_from_entity_id(hass, entity("camera", device, "camera"))
+    events = []
+    hass.bus.async_listen("blink_live_clip_saved", lambda event: events.append(
+        coordinator.snapshots[device.key]
+    ))
+    with patch(
+        "custom_components.blink_live.coordinator.video_snapshot",
+        AsyncMock(return_value=b"\xff\xd8derived"),
+    ) as derive:
+        await coordinator._notify("clip_saved", clip.event_data())
+        await hass.async_block_till_done()
+        derive.assert_awaited_once_with(coordinator.gateway.ffmpeg, path)
+        assert events == [b"\xff\xd8derived"]
+        assert await camera.async_camera_image() == b"\xff\xd8derived"
+        client = await hass_client_no_auth()
+        url = urlsplit(snapshot_url(coordinator, device.key))
+        response = await client.get(f"{url.path}?{url.query}")
+        assert response.status == 200
+        assert await response.read() == b"\xff\xd8derived"
+        coordinator.client.devices[device.key] = replace(
+            device, thumbnail=int((now - timedelta(minutes=1)).timestamp())
+        )
+        coordinator.client.resource = AsyncMock(return_value=b"\xff\xd8older blink")
+        await coordinator._refresh_snapshots()
+        assert await camera.async_camera_image() == b"\xff\xd8derived"
+        # An old clip is ignored, and a failed extraction retains the current image.
+        await coordinator._notify("clip_saved", clip.event_data())
+        assert derive.await_count == 1
+        newer = replace(clip, id="newer", created_at=(now + timedelta(seconds=10)).isoformat())
+        coordinator.recordings.state["archive"][newer.key] = {
+            "clip": newer.to_dict(), "path": str(path), "fingerprint": fingerprint(path)
+        }
+        derive.side_effect = BlinkError("Cannot decode video")
+        await coordinator._notify("clip_saved", newer.event_data())
+        assert await camera.async_camera_image() == b"\xff\xd8derived"
+        coordinator.options["automatic_downloads"] = False
+        await coordinator._notify("clip_saved", newer.event_data())
+        assert derive.await_count == 2
+    coordinator.client.capture_snapshot = AsyncMock(return_value=b"\xff\xd8fresh blink")
+    await coordinator.async_take_snapshot(device.key)
+    assert await camera.async_camera_image() == b"\xff\xd8fresh blink"
 
 
 async def test_system_arm_switches_isolate_networks_and_read_state(hass, motion_setup, device):

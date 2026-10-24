@@ -105,6 +105,12 @@ Discovery and motion sensors work with downloads off. Each newly enabled source
 establishes a historical baseline: existing clips remain available for explicit
 download, but are not announced as new or automatically archived.
 
+With live events enabled, a camera's motion changing from on to off starts extra
+recording checks every 5 seconds for up to 1 minute. Checks stop early when new
+clips for that camera have been downloaded (or discovered, if automatic downloads
+are off). Each camera has its own window. These checks use the configured USB/cloud
+sources and leave the normal device refresh interval unchanged.
+
 **Retention deletes only local files downloaded and indexed by Blink Live. It
 never deletes USB or cloud originals.** Scheduled pruning runs while automatic
 archiving is enabled; disabling automatic downloads also stops scheduled pruning.
@@ -135,8 +141,8 @@ data:
 
 This wakes the selected camera, waits for capture and refreshes its image cache.
 A failed capture preserves the previous image. It starts no live stream and saves
-no file. To save the image, follow it with HA's `camera.snapshot` action using an
-allowed destination. `camera.snapshot` alone saves the cached image without taking
+no standalone image file. To export the image, follow it with HA's `camera.snapshot`
+action using an allowed destination. `camera.snapshot` alone saves the cached image without taking
 a new photo.
 
 ### Snapshot URLs
@@ -161,9 +167,21 @@ a password. No Home Assistant bearer token or login is needed.
 Every request returns the latest cached JPEG without requesting a new capture,
 contacting Blink, or starting a live stream. Repeated HomeKit snapshot requests
 therefore do not wake the camera. The cache updates when the normal refresh finds
-a changed Blink thumbnail, or when `blink_live.take_snapshot` succeeds. It may be
+a changed Blink thumbnail, when `blink_live.take_snapshot` succeeds, or when an
+automatically archived video supplies a newer derived image. It may be
 older than the most recent motion event. Until an image is cached, the URL returns
 HTTP 404; a missing or incorrect token returns HTTP 401 for an available camera.
+
+With automatic downloads enabled, each saved video generates a JPEG from its
+first three frames. Only the newest derived image per camera is retained, using
+the video's recording time rather than its download time. HA camera images,
+`camera.snapshot`, HomeKit thumbnails and the snapshot URL all use the same cache,
+selecting the newer of the Blink thumbnail and the derived image. Blink timestamp
+references supply their capture time; references without a timestamp use the time
+they were first observed. Explicit captures use the time the request started.
+The cache persists across reloads and restarts. Turning automatic downloads off
+excludes derived images and uses only Blink thumbnails. A failed video extraction
+preserves the previous image and does not prevent the recording from being saved.
 
 ### System and camera controls
 

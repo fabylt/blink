@@ -3,7 +3,7 @@
 import asyncio
 import logging
 from collections import OrderedDict
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -23,7 +23,7 @@ from homeassistant.util.file import WriteError
 from .blink_live_client import AuthError, BlinkClient, BlinkError, VerificationRequired
 from .blink_live_client.gateway import StreamGateway
 from .blink_live_client.push import PushReceiver
-from .blink_live_client.recordings import Recordings
+from .blink_live_client.recordings import Recordings, archive_file
 from .blink_live_client.rtsp import RtspServer
 from .const import (
     DEFAULT_OPTIONS,
@@ -34,6 +34,7 @@ from .const import (
     stream_signal,
 )
 from .http_events import HttpEventDispatcher
+from .snapshot_cache import SnapshotCache, capture_time, thumbnail_time, video_snapshot
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -79,8 +80,13 @@ class BlinkLiveCoordinator(DataUpdateCoordinator):
         self.http_events = HttpEventDispatcher(
             hass, entry, self.client, async_get_clientsession(hass), self.options
         )
-        self.snapshots: dict[str, bytes] = {}
-        self.snapshot_cached_at: dict[str, str] = {}
+        self.snapshot_cache = SnapshotCache(
+            Store(hass, 1, f"{DOMAIN}.{entry.entry_id}.snapshots"),
+            self.options["automatic_downloads"],
+        )
+        self.snapshots = self.snapshot_cache.images
+        self.snapshot_cached_at = self.snapshot_cache.timestamps
+        self._derived_snapshot_lock = asyncio.Lock()
         self._thumbnail_urls: dict[str, str] = {}
         self._snapshot_locks: dict[str, asyncio.Lock] = {}
         self._failures = 0
@@ -96,6 +102,10 @@ class BlinkLiveCoordinator(DataUpdateCoordinator):
         self.ring_on_motion: dict[str, bool] = {}
         self._motion_timers: dict = {}
         self._motion_seen: OrderedDict = OrderedDict()
+        self._clip_windows: dict[str, datetime] = {}
+        self._clip_candidates: dict[str, set[str]] = {}
+        self._clip_poll_cancel = None
+        self._clip_poll_task: asyncio.Task | None = None
 
     @callback
     def _stream_changed(self, camera_key):
@@ -156,6 +166,12 @@ class BlinkLiveCoordinator(DataUpdateCoordinator):
         async_dispatcher_send(self.hass, push_signal(self.entry.entry_id))
 
     async def initialize(self):
+        await self.snapshot_cache.load()
+        self._thumbnail_urls = {
+            key: records["blink"]["reference"]
+            for key, records in self.snapshot_cache.records.items()
+            if "blink" in records
+        }
         try:
             await self.client.initialize()
         except (AuthError, VerificationRequired):
@@ -191,6 +207,24 @@ class BlinkLiveCoordinator(DataUpdateCoordinator):
                 ) from None
 
     async def _notify(self, kind, data):
+        if kind == "clip_saved" and self.options["automatic_downloads"]:
+            await self._derive_snapshot(data)
+        camera_key = data["camera_key"]
+        if camera_key in self._clip_windows:
+            candidates = self._clip_candidates[camera_key]
+            saved_new_clip = kind == "clip_saved" and data["clip_id"] in candidates
+            if kind == "clip_available":
+                candidates.add(data["clip_id"])
+            elif kind == "clip_saved":
+                candidates.discard(data["clip_id"])
+            if (kind == "clip_available" and not self.recordings.automatic) or (
+                saved_new_clip and not candidates
+            ):
+                self._clip_windows.pop(camera_key)
+                self._clip_candidates.pop(camera_key)
+                if not self._clip_windows and self._clip_poll_cancel:
+                    self._clip_poll_cancel()
+                    self._clip_poll_cancel = None
         device = self.client.devices.get(data["camera_key"])
         data = {
             **data,
@@ -264,6 +298,10 @@ class BlinkLiveCoordinator(DataUpdateCoordinator):
             }
             self.hass.bus.async_fire(f"{DOMAIN}_motion_cleared", cleared)
             self.http_events.emit("motion_cleared", cleared)
+            if source == "blink_push" and self.options["live_events"]:
+                self._clip_windows[camera_key] = dt_util.utcnow() + timedelta(seconds=60)
+                self._clip_candidates.setdefault(camera_key, set())
+                self._schedule_motion_clip_poll()
 
         self._motion_timers[camera_key] = async_call_later(
             self.hass,
@@ -275,6 +313,37 @@ class BlinkLiveCoordinator(DataUpdateCoordinator):
         self.http_events.emit("motion_detected", data)
         if device.kind == "doorbell" and self.ring_on_motion.get(camera_key, False):
             self.async_report_doorbell_press(camera_key, source="motion", motion_data=data)
+
+    @callback
+    def _schedule_motion_clip_poll(self):
+        if self._clip_windows and not self._clip_poll_cancel and not self._clip_poll_task:
+            self._clip_poll_cancel = async_call_later(self.hass, 5, self._poll_motion_clips)
+
+    async def _poll_motion_clips(self, _now):
+        """Check recordings only, independently of normal discovery/backoff."""
+        self._clip_poll_cancel = None
+        self._clip_poll_task = asyncio.current_task()
+        try:
+            for camera_key, deadline in tuple(self._clip_windows.items()):
+                if dt_util.utcnow() > deadline:
+                    self._clip_windows.pop(camera_key)
+                    self._clip_candidates.pop(camera_key)
+            if self._clip_windows:
+                try:
+                    await self.recordings.refresh()
+                except AuthError:
+                    self.entry.async_start_reauth(self.hass)
+                    self._clip_windows.clear()
+                    self._clip_candidates.clear()
+                except (BlinkError, OSError, ValueError, TypeError, KeyError):
+                    _LOGGER.debug("Blink motion recording check failed; retrying within window")
+            for camera_key, deadline in tuple(self._clip_windows.items()):
+                if dt_util.utcnow() >= deadline:
+                    self._clip_windows.pop(camera_key)
+                    self._clip_candidates.pop(camera_key)
+        finally:
+            self._clip_poll_task = None
+            self._schedule_motion_clip_poll()
 
     @callback
     def async_report_doorbell_press(
@@ -348,6 +417,25 @@ class BlinkLiveCoordinator(DataUpdateCoordinator):
         )
         return dict(self.client.devices)
 
+    async def _derive_snapshot(self, data):
+        """A failed thumbnail must never turn a committed recording into a failed download."""
+        async with self._derived_snapshot_lock:
+            try:
+                record = self.recordings.state["archive"].get(data["clip_id"])
+                if record is None:
+                    return
+                captured_at = capture_time(record["clip"]["created_at"])
+                camera_key = record["clip"]["camera_key"]
+                previous = self.snapshot_cache.records.get(camera_key, {}).get("derived")
+                if previous and capture_time(previous["captured_at"]) >= captured_at:
+                    return
+                path = await asyncio.to_thread(archive_file, record)
+                image = await video_snapshot(self.gateway.ffmpeg, path)
+                await self.snapshot_cache.update(camera_key, "derived", image, captured_at)
+                self.async_update_listeners()
+            except (BlinkError, OSError, ValueError, TypeError, KeyError, TimeoutError):
+                _LOGGER.warning("Blink Live could not derive a snapshot from an archived recording")
+
     async def _refresh_snapshots(self):
         for camera_key in tuple(self.client.devices):
             async with self._snapshot_locks.setdefault(camera_key, asyncio.Lock()):
@@ -358,11 +446,13 @@ class BlinkLiveCoordinator(DataUpdateCoordinator):
                     url = self.client.thumbnail_path(device)
                     if not url or self._thumbnail_urls.get(device.key) == url:
                         continue
+                    captured_at = thumbnail_time(device.thumbnail, dt_util.utcnow())
                     image = await self.client.resource(url, 4 * 1024 * 1024)
                     if image.startswith(b"\xff\xd8"):
-                        self.snapshots[device.key] = image
+                        await self.snapshot_cache.update(
+                            device.key, "blink", image, captured_at, url
+                        )
                         self._thumbnail_urls[device.key] = url
-                        self.snapshot_cached_at[device.key] = dt_util.utcnow().isoformat()
                 except AuthError:
                     raise
                 except BlinkError:
@@ -373,15 +463,24 @@ class BlinkLiveCoordinator(DataUpdateCoordinator):
             device = self.client.devices.get(camera_key)
             if device is None:
                 raise BlinkError("Camera is no longer available")
+            captured_at = dt_util.utcnow()
             image = await self.client.capture_snapshot(device)
-            self.snapshots[camera_key] = image
-            self.snapshot_cached_at[camera_key] = dt_util.utcnow().isoformat()
-            # Reconcile once more on the next poll in case metadata changed mid-download.
-            self._thumbnail_urls.pop(camera_key, None)
+            observed = self.client.devices.get(camera_key, device)
+            url = self.client.thumbnail_path(observed)
+            await self.snapshot_cache.update(camera_key, "blink", image, captured_at, url)
+            self._thumbnail_urls[camera_key] = url
             self.async_set_updated_data(dict(self.client.devices))
 
     async def close(self):
         self.motion_ready = False
+        self._clip_windows.clear()
+        self._clip_candidates.clear()
+        if self._clip_poll_cancel:
+            self._clip_poll_cancel()
+            self._clip_poll_cancel = None
+        if self._clip_poll_task:
+            self._clip_poll_task.cancel()
+            await asyncio.gather(self._clip_poll_task, return_exceptions=True)
         if self.push:
             await self.push.close()
         for cancel in self._motion_timers.values():

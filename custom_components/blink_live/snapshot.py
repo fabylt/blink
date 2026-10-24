@@ -1,4 +1,4 @@
-"""Stable, camera-scoped URLs serving only the current in-memory thumbnail."""
+"""Stable, camera-scoped URLs serving the currently selected cached snapshot."""
 
 import hashlib
 import hmac
