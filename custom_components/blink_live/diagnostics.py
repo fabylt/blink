@@ -18,6 +18,10 @@ async def async_get_config_entry_diagnostics(hass, entry):
         "known_clip_count": len(coordinator.recordings.state["seen"]),
         "archive_count": len(coordinator.recordings.state["archive"]),
         "pending_download_count": len(coordinator.recordings.state["pending"]),
+        "initial_sync_in_progress": bool(
+            coordinator._startup_task and not coordinator._startup_task.done()
+        ),
+        "recording_operation": coordinator.recordings.operation,
         "clip_error": coordinator.clip_error,
         "push_supported": True,
         "push_hardware_validation_required": True,

@@ -1,12 +1,15 @@
 import asyncio
 import copy
+import errno
+import logging
 import time
 from dataclasses import replace
 from unittest.mock import AsyncMock
 
 import pytest
 from blink_live_client import BlinkError
-from blink_live_client.recordings import Recordings, archive_file
+from blink_live_client.errors import ApiError, StorageBusy
+from blink_live_client.recordings import Recordings, archive_file, recording_error
 
 
 class FakeClient:
@@ -25,6 +28,85 @@ class FakeClient:
         if self.fail:
             raise BlinkError("interrupted")
         yield b"media"
+
+
+async def test_refresh_reports_listing_failure_after_pending_download_succeeds(
+    module, clip, memory, tmp_path
+):
+    client = FakeClient(module, [clip])
+    recordings = Recordings(client, {}, memory.save, memory.notify, tmp_path, automatic=True)
+    await recordings.refresh()
+    recordings.state["pending"] = [clip.key]
+    client.clips = AsyncMock(side_effect=ApiError(500))
+    with pytest.raises(ApiError):
+        await recordings.refresh()
+    assert recordings.operation == "USB clip listing"
+    assert clip.key in recordings.state["archive"]
+    assert recordings.state["pending"] == []
+
+
+@pytest.mark.parametrize("stage", ["listing", "download", "timeout"])
+async def test_busy_usb_preserves_queue_and_retries_on_later_refresh(
+    module, clip, memory, tmp_path, stage
+):
+    client = FakeClient(module, [])
+    recordings = Recordings(client, {}, memory.save, memory.notify, tmp_path, automatic=True)
+    await recordings.refresh()
+    other = replace(clip, id="other")
+    client.listed = [clip, other]
+    if stage == "listing":
+        # Simulate an already-persisted backlog at startup.
+        recordings.state["seen"] = {item.key: item.to_dict() for item in client.listed}
+        recordings.state["pending"] = [clip.key, other.key]
+        client.clips = AsyncMock(side_effect=ApiError(409))
+    else:
+        async def busy_chunks(_clip):
+            client.downloads += 1
+            if stage == "timeout":
+                raise TimeoutError
+            raise StorageBusy("Blink USB storage is busy; retry later")
+            yield  # pragma: no cover
+
+        client.clip_chunks = busy_chunks
+    with pytest.raises((BlinkError, TimeoutError)):
+        await recordings.refresh()
+    assert recordings.state["pending"] == [clip.key, other.key]
+    assert client.downloads == (0 if stage == "listing" else 1)
+    assert recordings.state["archive"] == {}
+    assert list(tmp_path.iterdir()) == []
+    client.clips = AsyncMock(return_value=[clip, other])
+    client.clip_chunks = FakeClient.clip_chunks.__get__(client)
+    await recordings.refresh()
+    assert recordings.state["pending"] == []
+    assert set(recordings.state["archive"]) == {clip.key, other.key}
+
+
+async def test_refresh_reports_missing_archive_directory(module, clip, memory, tmp_path):
+    client = FakeClient(module, [])
+    recordings = Recordings(
+        client, {}, memory.save, memory.notify, tmp_path / "missing", automatic=True
+    )
+    await recordings.refresh()
+    client.listed = [clip]
+    with pytest.raises(FileNotFoundError):
+        await recordings.refresh()
+    assert recordings.operation == "Archive directory access"
+    assert recordings.state["pending"] == [clip.key]
+
+
+@pytest.mark.parametrize(
+    ("error", "description"),
+    [
+        (ApiError(429), "Blink HTTP 429"),
+        (OSError(errno.ENOSPC, "disk full", "/private/archive"), "filesystem ENOSPC"),
+        (PermissionError(errno.EACCES, "denied", "/private/archive"), "filesystem EACCES"),
+        (KeyError("private vendor payload"), "KeyError"),
+        (ValueError("private URL"), "ValueError"),
+        (TimeoutError(), "operation timed out"),
+    ],
+)
+def test_recording_errors_are_actionable_without_exposing_private_details(error, description):
+    assert recording_error(error) == description
 
 
 async def test_baseline_late_arrival_changed_manifest_and_restart(module, clip, memory):
@@ -58,6 +140,34 @@ async def test_optional_archive_events_order_and_atomic_save(module, clip, memor
     await recordings.download(clip.key)
     assert client.downloads == 1
     assert len(memory.events) == 2
+
+
+@pytest.mark.parametrize("failure", [None, "transfer", "index"])
+async def test_download_debug_logs_distinguish_transfer_and_committed_file(
+    module, clip, memory, tmp_path, caplog, failure
+):
+    client = FakeClient(module, [clip])
+    recordings = Recordings(client, {}, memory.save, memory.notify, tmp_path)
+    await recordings.refresh()
+    if failure == "transfer":
+        client.fail = True
+    elif failure == "index":
+        recordings.save = AsyncMock(side_effect=OSError(errno.ENOSPC, "full", str(tmp_path)))
+    with caplog.at_level(logging.DEBUG, logger="blink_live_client"):
+        if failure:
+            with pytest.raises((BlinkError, OSError)):
+                await recordings.download(clip.key)
+        else:
+            path = await recordings.download(clip.key)
+            assert path.is_file()
+            assert clip.key in recordings.state["archive"]
+    assert f"Download started: clip={clip.key}" in caplog.text
+    assert f"Download progress: clip={clip.key}" in caplog.text
+    assert ("Download completed:" in caplog.text) is (failure is None)
+    assert ("Download failed:" in caplog.text) is (failure is not None)
+    if failure == "index":
+        assert "Archive index write" in caplog.text and "ENOSPC" in caplog.text
+    assert str(tmp_path) not in caplog.text
 
 
 async def test_archive_disabled_never_downloads(module, clip, memory, tmp_path):

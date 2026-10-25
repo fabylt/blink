@@ -241,6 +241,7 @@ async def motion_setup(
     ):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
+        await entry.runtime_data._startup_task
         registry = er.async_get(hass)
 
         def entity(domain, dev, suffix):
@@ -249,6 +250,39 @@ async def motion_setup(
         yield entry, data, entity, other, camera
         await hass.config_entries.async_unload(entry.entry_id)
         await hass.async_block_till_done()
+
+
+@pytest.mark.parametrize("finish", [True, False])
+async def test_startup_does_not_wait_for_usb_and_background_sync_cleans_up(
+    hass, motion_setup, device, finish
+):
+    entry, _, entity, _, _ = motion_setup
+    started, release, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def slow_usb(_recordings):
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    with patch("custom_components.blink_live.coordinator.Recordings.refresh", slow_usb):
+        assert await asyncio.wait_for(hass.config_entries.async_reload(entry.entry_id), 2)
+        coordinator = entry.runtime_data
+        await asyncio.wait_for(started.wait(), 2)
+        assert hass.states.get(entity("camera", device, "camera")).state != "unavailable"
+        assert coordinator.motion_ready
+        task = coordinator._startup_task
+        assert not task.done()
+        if finish:
+            release.set()
+            await asyncio.wait_for(task, 2)
+            assert not coordinator._startup_reconciling
+        assert await hass.config_entries.async_unload(entry.entry_id)
+        assert coordinator._startup_task is None
+        assert cancelled.is_set() is (not finish)
+        assert coordinator.gateway._runner is None
 
 
 @pytest.mark.parametrize("motion_setup", ["usb", "cloud", "all"], indirect=True)
@@ -324,6 +358,26 @@ async def test_recording_motion_routing_dedup_and_timer(hass, motion_setup, devi
     await hass.async_block_till_done()
     assert hass.states.get(motion).state == "on"
     assert len(events) == 5 and len(rings) == 1
+
+
+async def test_refresh_action_exposes_usb_failure_and_recovers(hass, motion_setup):
+    from custom_components.blink_live.blink_live_client.errors import ApiError
+
+    entry, _, _, _, _ = motion_setup
+    coordinator = entry.runtime_data
+    coordinator.client.clips = AsyncMock(side_effect=ApiError(429))
+    await coordinator.async_refresh()
+    assert coordinator.last_update_success
+    assert coordinator.clip_error == "USB clip listing failed: Blink HTTP 429"
+    with pytest.raises(HomeAssistantError, match="USB clip listing failed: Blink HTTP 429"):
+        await hass.services.async_call(
+            DOMAIN, "refresh_clips", {"entry_id": entry.entry_id}, blocking=True
+        )
+    coordinator.client.clips.side_effect = None
+    coordinator.client.clips.return_value = []
+    await coordinator.async_refresh()
+    assert coordinator.clip_error is None
+    assert coordinator._failures == 0
 
 
 async def test_backend_can_be_replaced_without_changing_entities(hass, motion_setup, device):

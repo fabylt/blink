@@ -1,5 +1,6 @@
 """Blink Live uses separate identity, authentication and services from official Blink."""
 
+import asyncio
 from pathlib import Path
 
 import probatio as vol
@@ -15,6 +16,7 @@ from .coordinator import BlinkLiveCoordinator
 from .snapshot import async_setup_snapshots
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+SETUP_TIMEOUT = 60
 
 
 async def async_setup(hass, config):
@@ -116,14 +118,24 @@ async def async_setup_entry(hass, entry):
     coordinator = BlinkLiveCoordinator(hass, entry)
     try:
         await async_setup_snapshots(hass, coordinator)
-        await coordinator.initialize()
-        await coordinator.async_config_entry_first_refresh()
+        async with asyncio.timeout(SETUP_TIMEOUT):
+            await coordinator.initialize()
+        # initialize() already discovers devices. USB manifests and pending
+        # downloads can take minutes and must not hold up HA's bootstrap.
+        coordinator.async_set_updated_data(dict(coordinator.client.devices))
         entry.runtime_data = coordinator
         hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
         # Initial reconciliation and restored switch state must never replay rings.
         coordinator.motion_ready = True
         await coordinator.start_push()
+        coordinator.start_initial_refresh()
+    except TimeoutError:
+        await coordinator.close()
+        raise ConfigEntryNotReady(
+            f"Blink Live account/device initialization timed out after {SETUP_TIMEOUT} "
+            "seconds; retrying"
+        ) from None
     except BlinkError:
         await coordinator.close()
         raise ConfigEntryNotReady("Blink Live service unavailable") from None

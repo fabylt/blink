@@ -111,6 +111,34 @@ clips for that camera have been downloaded (or discovered, if automatic download
 are off). Each camera has its own window. These checks use the configured USB/cloud
 sources and leave the normal device refresh interval unchanged.
 
+Startup makes cameras available after account and device discovery. USB clip
+listing, queued downloads and thumbnail updates then run in the background, so a
+busy hub or a large download backlog does not hold up Home Assistant startup.
+Account/device initialization times out after 60 seconds and Home Assistant
+retries it automatically.
+
+Explicit USB busy responses are retried up to three times with increasing pauses
+(2 then 4 seconds, or Blink's longer `Retry-After` value). If the hub stays busy
+or a download's hub command times out, the remaining clips for that hub stay
+queued for a later refresh. Other hubs can still sync. Timeouts and ambiguous
+command failures are not immediately replayed.
+
+Integration diagnostics include `initial_sync_in_progress`, `recording_operation`
+and `pending_download_count`. Info logging reports initial sync start/completion
+and queue sizes; debug logging reports busy retries and download progress.
+
+Enable the integration's **debug logging** before reproducing a sync problem.
+It captures successful API/media connections, HTTP status and timing, bounded
+JSON summaries, hub command waits/completion, listing/baseline/new-clip counts,
+and each download's start, byte progress, failure or successful local commit.
+The stable clip ID in download logs matches `blink-live-CLIP_ID.mp4`. A
+`Download completed` entry means the file and archive index have been committed;
+`Download started` alone does not mean a local copy exists yet.
+
+JSON summaries retain protocol flags, status codes, counts and up to three sample
+items. Credentials, names, account/camera identifiers, URLs and arbitrary vendor
+text are redacted. Full raw payloads and authorization headers are not logged.
+
 **Retention deletes only local files downloaded and indexed by Blink Live. It
 never deletes USB or cloud originals.** Scheduled pruning runs while automatic
 archiving is enabled; disabling automatic downloads also stops scheduled pruning.

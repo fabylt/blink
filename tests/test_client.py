@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 from dataclasses import replace
 from unittest.mock import AsyncMock
@@ -7,7 +8,7 @@ import aiohttp
 import pytest
 from aiohttp import web
 from blink_live_client import BlinkClient, BlinkError
-from blink_live_client.errors import ApiError
+from blink_live_client.errors import ApiError, AuthError, StorageBusy
 
 
 def state():
@@ -76,6 +77,167 @@ async def test_discovery_and_usb_manifest_pagination(server, device, module):
         assert [kind for kind, _ in observations] == ["homescreen", "usb_manifest", "usb_manifest"]
         assert observations[-1][1]["module_id"] == 4
         assert observations[-1][1]["clips"][0]["id"] == 6
+
+
+@pytest.mark.parametrize("content_length", [False, True])
+async def test_usb_manifest_received_in_multiple_network_chunks(
+    server, device, module, content_length
+):
+    payload = json.dumps({
+        "manifest_id": 11,
+        "clips": [{"id": 5, "camera_id": device.id, "created_at": "2026-10-19T12:00:00Z"}],
+    }).encode()
+    calls = []
+
+    async def handler(request):
+        calls.append((request.method, request.path))
+        if request.path.endswith("manifest/request"):
+            return web.json_response({"id": 10})
+        if request.path.endswith("commands/10"):
+            return web.json_response({"complete": True})
+        assert request.path.endswith("media/10")
+        response = web.StreamResponse(headers={"Content-Type": "application/json"})
+        if content_length:
+            response.content_length = len(payload)
+        await response.prepare(request)
+        await response.write(payload[:17])
+        await asyncio.sleep(0.02)
+        await response.write(payload[17:])
+        return response
+
+    root = await server(handler)
+
+    class LocalClient(BlinkClient):
+        @property
+        def root(self):
+            return root
+
+    async with aiohttp.ClientSession() as session:
+        client = LocalClient(session, state())
+        client.devices = {device.key: device}
+        clips = await client.clips(module)
+        assert len(clips) == 1
+        assert clips[0].id == "5"
+        assert clips[0].camera_key == device.key
+    assert sum(method == "POST" for method, _ in calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("payload", "error"),
+    [
+        (b'{"value":"' + b"x" * 20 + b'"}', None),
+        (b'{"value":"' + b"x" * 21 + b'"}', "Blink JSON response exceeds size limit"),
+        (b'{"broken":', "Invalid Blink JSON response"),
+    ],
+)
+async def test_fragmented_json_preserves_size_limit_and_validation(
+    server, monkeypatch, payload, error
+):
+    monkeypatch.setattr("blink_live_client.client.MAX_JSON", 32)
+    calls = 0
+
+    async def handler(request):
+        nonlocal calls
+        calls += 1
+        response = web.StreamResponse(headers={"Content-Type": "application/json"})
+        await response.prepare(request)
+        await response.write(payload[:5])
+        await asyncio.sleep(0.02)
+        await response.write(payload[5:])
+        return response
+
+    root = await server(handler)
+
+    class LocalClient(BlinkClient):
+        @property
+        def root(self):
+            return root
+
+    async with aiohttp.ClientSession() as session:
+        client = LocalClient(session, state())
+        if error:
+            with pytest.raises(BlinkError, match=error):
+                await client.request("POST", "/command", {})
+        else:
+            assert await client.request("POST", "/command", {}) == {"value": "x" * 20}
+    assert calls == 1
+
+
+@pytest.mark.parametrize("busy", [{"code": 307}, ApiError(409), ApiError(423), ApiError(429, 7)])
+async def test_usb_busy_retries_then_returns_result(busy, monkeypatch):
+    sleep = AsyncMock()
+    monkeypatch.setattr("blink_live_client.client.asyncio.sleep", sleep)
+    async with aiohttp.ClientSession() as session:
+        client = BlinkClient(session, state())
+        client.request = AsyncMock(side_effect=[busy, busy, {"id": 10}])
+        assert await client._storage_request("POST", "/usb/manifest", {}) == {"id": 10}
+        assert client.request.await_count == 3
+        expected = [7, 7] if isinstance(busy, ApiError) and busy.status == 429 else [2, 4]
+        assert [call.args[0] for call in sleep.await_args_list] == expected
+
+
+async def test_usb_busy_retries_are_bounded_and_cancellable(monkeypatch):
+    sleep = AsyncMock()
+    monkeypatch.setattr("blink_live_client.client.asyncio.sleep", sleep)
+    async with aiohttp.ClientSession() as session:
+        client = BlinkClient(session, state())
+        client.request = AsyncMock(return_value={"code": 307})
+        with pytest.raises(StorageBusy, match="storage is busy"):
+            await client._storage_request("POST", "/usb/manifest", {})
+        assert client.request.await_count == 3
+        assert sleep.await_count == 2
+        client.request.reset_mock()
+        sleep.side_effect = asyncio.CancelledError
+        with pytest.raises(asyncio.CancelledError):
+            await client._storage_request("POST", "/usb/manifest", {})
+        assert client.request.await_count == 1
+
+
+async def test_usb_manifest_command_recovers_from_busy(module, monkeypatch):
+    sleep = AsyncMock()
+    monkeypatch.setattr("blink_live_client.client.asyncio.sleep", sleep)
+    async with aiohttp.ClientSession() as session:
+        client = BlinkClient(session, state())
+        client.request = AsyncMock(side_effect=[
+            {"code": 307}, {"id": 10}, {"complete": True},
+            {"manifest_id": 11, "clips": []},
+        ])
+        assert await client.clips(module) == []
+        assert [call.args[0] for call in client.request.await_args_list] == [
+            "POST", "POST", "GET", "GET"
+        ]
+        sleep.assert_awaited_once_with(2)
+
+
+async def test_usb_download_preparation_recovers_from_busy(module, clip, monkeypatch):
+    sleep = AsyncMock()
+    monkeypatch.setattr("blink_live_client.client.asyncio.sleep", sleep)
+    async with aiohttp.ClientSession() as session:
+        client = BlinkClient(session, state())
+        client.modules = {module.id: module}
+        client._clips = AsyncMock(return_value=[clip])
+        client.wait_command = AsyncMock()
+        client.request = AsyncMock(side_effect=[{"code": 307}, {"id": 12}])
+
+        async def chunks(_path):
+            yield b"video"
+
+        client.resource_chunks = chunks
+        assert b"".join([part async for part in client.clip_chunks(clip)]) == b"video"
+        assert client.request.await_count == 2
+        client._clips.assert_awaited_once()
+        client.wait_command.assert_awaited_once_with(module.network_id, 12)
+        sleep.assert_awaited_once_with(2)
+
+
+@pytest.mark.parametrize("error", [ApiError(503), AuthError("expired"), BlinkError("timeout")])
+async def test_usb_does_not_replay_ambiguous_or_auth_failed_commands(error):
+    async with aiohttp.ClientSession() as session:
+        client = BlinkClient(session, state())
+        client.request = AsyncMock(side_effect=error)
+        with pytest.raises(type(error)):
+            await client._storage_request("POST", "/usb/manifest", {})
+        assert client.request.await_count == 1
 
 
 async def test_liveview_starts_without_waiting_for_command(device, monkeypatch):

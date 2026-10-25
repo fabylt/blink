@@ -9,6 +9,10 @@ class AuthError(BlinkError):
     """A new interactive sign-in is required."""
 
 
+class StorageBusy(BlinkError):
+    """Blink explicitly rejected a USB operation because the system is busy."""
+
+
 class ApiError(BlinkError):
     def __init__(self, status: int, retry_after: float = 0) -> None:
         self.status = status

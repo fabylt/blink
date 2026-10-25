@@ -23,7 +23,7 @@ from homeassistant.util.file import WriteError
 from .blink_live_client import AuthError, BlinkClient, BlinkError, VerificationRequired
 from .blink_live_client.gateway import StreamGateway
 from .blink_live_client.push import PushReceiver
-from .blink_live_client.recordings import Recordings, archive_file
+from .blink_live_client.recordings import Recordings, archive_file, recording_error
 from .blink_live_client.rtsp import RtspServer
 from .const import (
     DEFAULT_OPTIONS,
@@ -106,6 +106,28 @@ class BlinkLiveCoordinator(DataUpdateCoordinator):
         self._clip_candidates: dict[str, set[str]] = {}
         self._clip_poll_cancel = None
         self._clip_poll_task: asyncio.Task | None = None
+        self._startup_task: asyncio.Task | None = None
+        self._startup_reconciling = True
+
+    @callback
+    def start_initial_refresh(self):
+        """Reconcile recordings after entities are available, outside HA bootstrap."""
+        self._startup_task = self.entry.async_create_background_task(
+            self.hass, self._initial_refresh(), "Blink initial recording refresh"
+        )
+
+    async def _initial_refresh(self):
+        _LOGGER.info("Blink Live initial recording sync started in the background")
+        try:
+            await self.async_refresh()
+            paused = self.clip_error or not self.last_update_success
+            _LOGGER.info(
+                "Blink Live initial recording sync %s: %s archived, %s pending",
+                "paused for retry" if paused else "finished",
+                len(self.recordings.state["archive"]), len(self.recordings.state["pending"]),
+            )
+        finally:
+            self._startup_reconciling = False
 
     @callback
     def _stream_changed(self, camera_key):
@@ -166,6 +188,7 @@ class BlinkLiveCoordinator(DataUpdateCoordinator):
         async_dispatcher_send(self.hass, push_signal(self.entry.entry_id))
 
     async def initialize(self):
+        _LOGGER.debug("Blink Live initialization: loading snapshot cache")
         await self.snapshot_cache.load()
         self._thumbnail_urls = {
             key: records["blink"]["reference"]
@@ -173,7 +196,12 @@ class BlinkLiveCoordinator(DataUpdateCoordinator):
             if "blink" in records
         }
         try:
+            _LOGGER.debug("Blink Live initialization: connecting and discovering devices")
             await self.client.initialize()
+            _LOGGER.debug(
+                "Blink Live connection established: %s cameras, %s hubs",
+                len(self.client.devices), len(self.client.modules),
+            )
         except (AuthError, VerificationRequired):
             raise ConfigEntryAuthFailed("Blink Live requires sign-in or verification") from None
         directory = self.options["archive_directory"]
@@ -188,6 +216,11 @@ class BlinkLiveCoordinator(DataUpdateCoordinator):
             self.options["automatic_downloads"],
             self.options["retention_days"],
             self.options["recording_source"],
+        )
+        _LOGGER.debug(
+            "Blink Live archive state loaded: known=%s archived=%s pending=%s",
+            len(self.recordings.state["seen"]), len(self.recordings.state["archive"]),
+            len(self.recordings.state["pending"]),
         )
         await self.gateway.start()
         if self.options["rtsp_enabled"]:
@@ -234,7 +267,7 @@ class BlinkLiveCoordinator(DataUpdateCoordinator):
         }
         self.hass.bus.async_fire(f"{DOMAIN}_{kind}", data)
         async_dispatcher_send(self.hass, f"{DOMAIN}_{self.entry.entry_id}_{kind}", data)
-        if kind == "clip_available":
+        if kind == "clip_available" and not self._startup_reconciling:
             self.async_report_motion(
                 data["camera_key"],
                 source="recording",
@@ -335,8 +368,11 @@ class BlinkLiveCoordinator(DataUpdateCoordinator):
                     self.entry.async_start_reauth(self.hass)
                     self._clip_windows.clear()
                     self._clip_candidates.clear()
-                except (BlinkError, OSError, ValueError, TypeError, KeyError):
-                    _LOGGER.debug("Blink motion recording check failed; retrying within window")
+                except (BlinkError, OSError, ValueError, TypeError, KeyError) as error:
+                    _LOGGER.debug(
+                        "Blink motion recording check failed: %s: %s",
+                        self.recordings.operation, recording_error(error),
+                    )
             for camera_key, deadline in tuple(self._clip_windows.items()):
                 if dt_util.utcnow() >= deadline:
                     self._clip_windows.pop(camera_key)
@@ -400,12 +436,12 @@ class BlinkLiveCoordinator(DataUpdateCoordinator):
             self._failures = 0
         except AuthError:
             raise ConfigEntryAuthFailed("Blink Live authorization expired") from None
-        except (BlinkError, OSError, ValueError, TypeError, KeyError):
+        except (BlinkError, OSError, ValueError, TypeError, KeyError) as error:
             # Recording unavailability must not disable live cameras.
-            self.clip_error = "Recording refresh or archive operation failed"
+            self.clip_error = f"{self.recordings.operation} failed: {recording_error(error)}"
             self._failures += 1
             if self._failures == 1:
-                _LOGGER.warning("Blink Live recording refresh or archive operation failed")
+                _LOGGER.warning("Blink Live %s", self.clip_error)
         self.update_interval = timedelta(
             seconds=max(
                 self.options["poll_interval"],
@@ -473,6 +509,10 @@ class BlinkLiveCoordinator(DataUpdateCoordinator):
 
     async def close(self):
         self.motion_ready = False
+        if self._startup_task:
+            self._startup_task.cancel()
+            await asyncio.gather(self._startup_task, return_exceptions=True)
+            self._startup_task = None
         self._clip_windows.clear()
         self._clip_candidates.clear()
         if self._clip_poll_cancel:

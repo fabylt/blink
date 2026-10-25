@@ -3,7 +3,9 @@
 import asyncio
 import hashlib
 import json
+import logging
 import re
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from urllib.parse import urlencode, urljoin, urlsplit, urlunsplit
@@ -11,10 +13,12 @@ from urllib.parse import urlencode, urljoin, urlsplit, urlunsplit
 import aiohttp
 
 from .auth import USER_AGENT, Auth, SaveTokens
-from .errors import ApiError, AuthError, BlinkError, VerificationRequired
+from .debug import payload_summary, request_operation
+from .errors import ApiError, AuthError, BlinkError, StorageBusy, VerificationRequired
 from .models import Clip, Device, Network, SyncModule
 
 MAX_JSON = 8 * 1024 * 1024
+_LOGGER = logging.getLogger(__name__)
 
 
 def remote_id(value) -> str:
@@ -63,7 +67,10 @@ class BlinkClient:
     ) -> dict:
         """Retry reads on outages; never blindly replay remote command creation."""
         token = await self.auth.token()
+        operation = request_operation(path)
         for attempt in range(3):
+            started = time.monotonic()
+            _LOGGER.debug("Blink request started: %s %s attempt=%s", method, operation, attempt + 1)
             try:
                 async with self.session.request(
                     method,
@@ -81,6 +88,10 @@ class BlinkClient:
                     allow_redirects=False,
                     timeout=aiohttp.ClientTimeout(total=30),
                 ) as response:
+                    _LOGGER.debug(
+                        "Blink response received: %s %s HTTP %s after %.2fs",
+                        method, operation, response.status, time.monotonic() - started,
+                    )
                     if response.status == 401 and attempt == 0:
                         token = await self.auth.token(rejected=token)
                         continue
@@ -92,12 +103,22 @@ class BlinkClient:
                         except ValueError:
                             retry = 0
                         raise ApiError(response.status, retry)
-                    data = await response.content.read(MAX_JSON + 1)
-                    if len(data) > MAX_JSON:
-                        raise BlinkError("Blink JSON response exceeds size limit")
+                    # read(n) may return the first available network fragment.
+                    # Collect through EOF before parsing, while bounding the body.
+                    data = bytearray()
+                    async for chunk in response.content.iter_chunked(64 * 1024):
+                        if len(data) + len(chunk) > MAX_JSON:
+                            raise BlinkError("Blink JSON response exceeds size limit")
+                        data.extend(chunk)
                     value = json.loads(data) if data else {}
                     if not isinstance(value, dict):
                         raise BlinkError("Invalid Blink response shape")
+                    if _LOGGER.isEnabledFor(logging.DEBUG):
+                        _LOGGER.debug(
+                            "Blink response JSON: %s bytes=%s elapsed=%.2fs payload=%s",
+                            operation, len(data), time.monotonic() - started,
+                            json.dumps(payload_summary(value)),
+                        )
                     if path in {
                         f"/api/v{version}/accounts/{self.auth.state.get('account_id')}/homescreen"
                         for version in (3, 4)
@@ -106,16 +127,21 @@ class BlinkClient:
                             self._push_client_id = remote_id(identifier)
                     return value
             except ApiError as error:
+                _LOGGER.debug("Blink request failed: %s HTTP %s", operation, error.status)
                 if method != "GET" or error.status not in (429, 500, 502, 503, 504):
                     raise
                 if attempt == 2:
                     raise
-                await asyncio.sleep(max(error.retry_after, 2**attempt))
-            except (aiohttp.ClientError, TimeoutError):
+                delay = max(error.retry_after, 2**attempt)
+                _LOGGER.debug("Blink read retry: %s in %ss", operation, delay)
+                await asyncio.sleep(delay)
+            except (aiohttp.ClientError, TimeoutError) as error:
+                _LOGGER.debug("Blink request failed: %s %s", operation, type(error).__name__)
                 if method != "GET" or attempt == 2:
                     raise BlinkError("Blink service unavailable") from None
                 await asyncio.sleep(2**attempt)
             except (ValueError, TypeError):
+                _LOGGER.debug("Blink response could not be parsed as JSON: %s", operation)
                 raise BlinkError("Invalid Blink JSON response") from None
         raise BlinkError("Blink request exhausted retries")
 
@@ -446,12 +472,14 @@ class BlinkClient:
         )
 
     async def wait_command(self, network_id: int, command_id: int) -> None:
+        _LOGGER.debug("Blink hub command: waiting for completion")
         async with asyncio.timeout(90):
             while True:
                 status = await self.command(network_id, command_id)
                 if status.get("status") == "failed":
                     raise BlinkError("Blink command failed")
                 if status.get("complete") or status.get("status") == "complete":
+                    _LOGGER.debug("Blink hub command: completed")
                     return
                 await asyncio.sleep(min(10, max(1, float(status.get("polling_interval", 2)))))
 
@@ -470,18 +498,41 @@ class BlinkClient:
         async with self.module_lock(module.id):
             return await self._clips(module)
 
+    async def _storage_request(self, method: str, path: str, body: dict | None = None) -> dict:
+        """Retry explicit USB busy rejections, never ambiguous command failures."""
+        for attempt in range(3):
+            try:
+                result = await self.request(method, path, body)
+            except ApiError as error:
+                if (
+                    error.status not in (409, 423, 429)
+                    or (method == "GET" and error.status == 429)
+                    or attempt == 2
+                ):
+                    raise
+                delay = max(2 ** (attempt + 1), error.retry_after)
+            else:
+                if result.get("code") != 307:
+                    return result
+                if attempt == 2:
+                    raise StorageBusy("Blink USB storage is busy; retry later")
+                delay = 2 ** (attempt + 1)
+            _LOGGER.debug("Blink USB storage busy; retry %s in %s seconds", attempt + 1, delay)
+            await asyncio.sleep(delay)
+        raise StorageBusy("Blink USB storage is busy; retry later")
+
     async def _clips(self, module: SyncModule) -> list[Clip]:
         base = self.storage_path(module)
-        command = await self.request("POST", f"{base}/manifest/request", {})
+        command = await self._storage_request("POST", f"{base}/manifest/request", {})
         command_id = int(remote_id(command["id"]))
         await self.wait_command(module.network_id, command_id)
         # New Android uses /media/{command}; retain the older manifest endpoint for older firmware.
         try:
-            data = await self.request("GET", f"{base}/media/{command_id}")
+            data = await self._storage_request("GET", f"{base}/media/{command_id}")
         except ApiError as error:
             if error.status != 404:
                 raise
-            data = await self.request("GET", f"{base}/manifest/request/{command_id}")
+            data = await self._storage_request("GET", f"{base}/manifest/request/{command_id}")
         clips: dict[str, Clip] = {}
         pages: set[str] = set()
         for _ in range(100):
@@ -516,7 +567,7 @@ class BlinkClient:
             if cursor in pages:
                 raise BlinkError("USB manifest pagination did not advance")
             pages.add(cursor)
-            data = await self.request(
+            data = await self._storage_request(
                 "GET",
                 f"{base}/media/{command_id}?{urlencode({'pagination_key': cursor})}",
             )
@@ -626,6 +677,7 @@ class BlinkClient:
                     allow_redirects=False,
                     timeout=aiohttp.ClientTimeout(total=180, sock_read=30),
                 ) as response:
+                    _LOGGER.debug("Blink media connection opened: HTTP %s", response.status)
                     if response.status == 401 and attempt == 0:
                         token = await self.auth.token(rejected=token)
                         continue
@@ -641,6 +693,7 @@ class BlinkClient:
                         yield chunk
                     if not total:
                         raise BlinkError("Blink returned empty media")
+                    _LOGGER.debug("Blink media transfer complete: bytes=%s", total)
                     return
         except (aiohttp.ClientError, TimeoutError):
             raise BlinkError("Blink media transfer failed") from None
@@ -661,12 +714,14 @@ class BlinkClient:
             raise BlinkError("USB storage is unavailable")
         async with self.module_lock(module.id):
             # Refresh the manifest so saved metadata never reuses an obsolete manifest ID.
+            _LOGGER.debug("USB download: refreshing manifest for clip=%s", clip.key)
             current = {item.key: item for item in await self._clips(module)}
             if clip.key not in current:
                 raise BlinkError("Recording is no longer available on USB storage")
             clip = current[clip.key]
             path = f"{self.storage_path(module)}/manifest/{clip.manifest_id}/clip/request/{clip.id}"
-            command = await self.request("POST", path, {})
+            _LOGGER.debug("USB download: requesting hub upload for clip=%s", clip.key)
+            command = await self._storage_request("POST", path, {})
             await self.wait_command(module.network_id, int(remote_id(command["id"])))
             for attempt in range(3):
                 try:

@@ -1,5 +1,6 @@
 """Tests against Home Assistant 2026.10 (skipped by the lightweight client environment)."""
 
+import asyncio
 from dataclasses import replace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -10,7 +11,7 @@ pytest.importorskip("homeassistant")
 from homeassistant import config_entries
 from homeassistant.core import Context, State, callback
 from homeassistant.data_entry_flow import FlowResultType
-from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -201,6 +202,9 @@ async def test_setup_and_unload_release_gateway(hass, client):
     ):
         assert await async_setup_entry(hass, entry)
         assert entry.runtime_data is coordinator
+        coordinator.async_config_entry_first_refresh.assert_not_awaited()
+        coordinator.async_set_updated_data.assert_called_once()
+        coordinator.start_initial_refresh.assert_called_once()
         assert await async_unload_entry(hass, entry)
         coordinator.close.assert_awaited_once()
         coordinator.async_shutdown.assert_awaited_once()
@@ -219,6 +223,27 @@ async def test_setup_auth_failure_releases_gateway(hass, client):
         with pytest.raises(ConfigEntryAuthFailed):
             await async_setup_entry(hass, entry)
         coordinator.close.assert_awaited_once()
+
+
+async def test_setup_account_timeout_retries_and_releases_resources(hass, client):
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="1", data=dict(client.auth.state))
+    entry.add_to_hass(hass)
+    coordinator = MagicMock()
+
+    async def blocked():
+        await asyncio.Event().wait()
+
+    coordinator.initialize = AsyncMock(side_effect=blocked)
+    coordinator.close = AsyncMock()
+    with (
+        patch("custom_components.blink_live.BlinkLiveCoordinator", return_value=coordinator),
+        patch("custom_components.blink_live.async_setup_snapshots", new_callable=AsyncMock),
+        patch("custom_components.blink_live.SETUP_TIMEOUT", 0.01),
+    ):
+        with pytest.raises(ConfigEntryNotReady, match="initialization timed out"):
+            await async_setup_entry(hass, entry)
+        coordinator.close.assert_awaited_once()
+        coordinator.start_initial_refresh.assert_not_called()
 
 
 async def test_homekit_doorbell_event_mapping_is_press_only():
@@ -318,6 +343,7 @@ async def test_real_entry_platforms_recording_events_and_reload(
     ):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
+        await entry.runtime_data._startup_task
         assert entry.runtime_data.recordings.recording_source == recording_source
         assert cloud_clips.await_count == (0 if recording_source == "usb" else 1)
         registry = er.async_get(hass)

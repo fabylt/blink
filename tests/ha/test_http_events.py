@@ -387,7 +387,10 @@ async def test_diagnostics_exclude_request_and_rtsp_secrets(hass):
         push=None,
         client=SimpleNamespace(devices={}, modules={}),
         clip_error=None,
-        recordings=SimpleNamespace(state={"seen": [], "archive": [], "pending": []}),
+        _startup_task=None,
+        recordings=SimpleNamespace(
+            state={"seen": [], "archive": [], "pending": []}, operation="USB clip listing"
+        ),
         http_events=SimpleNamespace(results={}),
     )
     with patch(
@@ -400,6 +403,8 @@ async def test_diagnostics_exclude_request_and_rtsp_secrets(hass):
     serialized = json.dumps(result)
     assert "private" not in serialized and "secret-token" not in serialized
     assert result["http_rule_count"] == 1
+    assert result["initial_sync_in_progress"] is False
+    assert result["recording_operation"] == "USB clip listing"
 
 
 async def test_template_variables_include_actual_camera_entity(hass, device):
